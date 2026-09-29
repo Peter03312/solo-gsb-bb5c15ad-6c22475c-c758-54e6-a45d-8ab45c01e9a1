@@ -21,13 +21,16 @@
 * ``TARGET_AMBIGUOUS``：硬链接目标比较键命中同键重复组（目标身份不唯一）。
 * ``TARGET_IS_DIRECTORY``：硬链接直接指向的是目录（硬链接只能指向普通文件，
   不能逐级穿过目录）。
-* ``TARGET_CYCLE``：硬链接目标链成环（再次沿链遇到已经过的硬链接）。
-* ``TARGET_BLOCKED``：目标链途经的条目本身被阻断（链上首个阻断节点，含最终
-  普通文件被阻断的情形）；目标阻断沿链传播。
+* ``TARGET_CYCLE``：硬链接**自身属于目标环**——其 ok 目标边位于某个有向环上
+  （再次沿链遇到已经过的硬链接）。仅环成员命中本原因。
+* ``TARGET_BLOCKED``：硬链接自身不在环上，但目标链无法到达可落盘的普通文件：
+  链上首个被阻断节点（含指向目标环的环外硬链接——环入口即链上首个被阻断
+  目标；以及最终普通文件被阻断的情形）；目标阻断沿链传播。
 
 每条条目可同时携带多个阻断原因；``primary_block_reason`` 取其中枚举序最靠前
-（最根本）的一个，便于调用方快速分类。环判定为纯结构属性（沿 ok 边追踪，与
-阻断状态无关），结果不依赖条目遍历顺序。
+（最根本）的一个，便于调用方快速分类。环成员身份为纯结构属性（沿 ok 边求环，
+与阻断状态无关），结果不依赖条目遍历顺序；因此环外指向该环的硬链接只报
+``TARGET_BLOCKED``，不会误报为环成员。
 
 可执行顺序（硬链接只依赖其**直接目标**——落盘时只需直接目标已存在）：每一步
 在“未排定且自身未阻断且依赖已满足”的条目中选**原下标最小**者；文件与目录
@@ -262,10 +265,38 @@ def plan_hardlinks(
     def node(index: int) -> ChainNode:
         return ChainNode(index, by_index[index].canonical_path)
 
-    # 5) 沿链追踪（纯结构判定，与节点阻断状态无关，保证结果与遍历顺序无关）：
-    #    普通文件结束；硬链接继续；再次遇到链上硬链接即 TARGET_CYCLE；
-    #    缺目/歧义/目录/目标不安全按链位置归类（起点为自身原因，途经点传播
-    #    TARGET_BLOCKED）；正常到达的链上若存在被阻断节点也传播 TARGET_BLOCKED。
+    # 5) 目标环成员集合（纯结构判定，沿“硬链接→硬链接”的 ok 边求有向环，
+    #    与节点阻断状态、遍历顺序无关）。只有自身位于环上的硬链接才算环成员；
+    #    从环外指向环的硬链接（“尾巴”）不在其中。
+    hlink_ok_target: dict[int, int] = {
+        i: outcome[1]
+        for i, outcome in direct.items()
+        if outcome[0] == "ok"
+        and by_index[outcome[1]].entry_type == HARDLINK_TYPE
+    }
+    cycle_members: set[int] = set()
+    globally_seen: set[int] = set()
+    for start in hlink_ok_target:
+        if start in globally_seen:
+            continue
+        path: list[int] = []
+        index_to_pos: dict[int, int] = {}
+        cur: int | None = start
+        while cur is not None and cur in hlink_ok_target and cur not in globally_seen:
+            if cur in index_to_pos:
+                cycle_members.update(path[index_to_pos[cur] :])
+                break
+            index_to_pos[cur] = len(path)
+            path.append(cur)
+            cur = hlink_ok_target[cur]
+        globally_seen.update(path)
+
+    # 6) 沿链追踪（环成员身份由上一步的结构集合给出，保证结果与遍历顺序无关）：
+    #    普通文件结束；硬链接继续；再次遇到链上硬链接时——该硬链接属于环则
+    #    TARGET_CYCLE（仅环成员），否则它是指向目标环的环外条目，记
+    #    TARGET_BLOCKED（环入口为链上首个被阻断目标）；缺目/歧义/目录/目标不
+    #    安全按链位置归类（起点为自身原因，途经点传播 TARGET_BLOCKED）；正常
+    #    到达的链上若存在被阻断节点也传播 TARGET_BLOCKED。
     for entry in entries:
         if entry.entry_type != HARDLINK_TYPE or entry.unsafe:
             continue
@@ -280,6 +311,8 @@ def plan_hardlinks(
         visited = {idx}
         current = idx
         final_file: int | None = None
+        # 追踪途中命中的环入口（再次遇到的链上硬链接）。
+        repeated_hardlink: int | None = None
 
         if own_direct[0] in ("missing", "ambiguous"):
             pass  # 直接目标原因已在解析阶段添加
@@ -327,14 +360,42 @@ def plan_hardlinks(
                     final_file = target_index
                     break
                 if target_index in visited:
-                    add_reason(
-                        idx,
-                        HardlinkBlockReason.TARGET_CYCLE,
-                        related=[target_index],
-                    )
+                    # 函数图中再次命中的硬链接必在某个环上。只有自身属于该环
+                    # 才报 TARGET_CYCLE；环外条目（环的“尾巴”）由随后的首阻断
+                    # 节点扫描统一记 TARGET_BLOCKED（环入口即链上首个被阻断目标）。
+                    repeated_hardlink = target_index
+                    if idx in cycle_members:
+                        add_reason(
+                            idx,
+                            HardlinkBlockReason.TARGET_CYCLE,
+                            related=[target_index],
+                        )
                     break
                 visited.add(target_index)
                 current = target_index
+
+        # 环外条目追踪到目标环入口即止（未到达普通文件）：沿链找“自身被阻断”
+        # 的首个目标——环成员（环入口起即属于目标环），或带独立阻断原因（步骤
+        # 1–4，非传播而来的 TARGET_BLOCKED）的节点；单纯因上游阻断而被传播的
+        # 尾巴不算。判定只用结构集合与步骤 1–4 的原因，与遍历顺序无关。关联下标
+        # 只指向这“链上首个被阻断目标”。
+        if (
+            final_file is None
+            and repeated_hardlink is not None
+            and idx not in cycle_members
+        ):
+            for stepped in chain[1:]:
+                stepped_index = stepped.index
+                if stepped_index in cycle_members or any(
+                    reason is not HardlinkBlockReason.TARGET_BLOCKED
+                    for reason in plan[stepped_index].block_reasons
+                ):
+                    add_reason(
+                        idx,
+                        HardlinkBlockReason.TARGET_BLOCKED,
+                        related=[stepped_index],
+                    )
+                    break
 
         # 结构上到达普通文件：检查链上（除自身外）首个被阻断节点并传播。
         if final_file is not None:
@@ -350,7 +411,7 @@ def plan_hardlinks(
         p.target_chain = chain
         p.final_file_index = final_file
 
-    # 6) 可执行顺序：文件/目录无依赖；硬链接依赖其**直接目标**已落盘。
+    # 7) 可执行顺序：文件/目录无依赖；硬链接依赖其**直接目标**已落盘。
     #    每步在依赖已满足的未排定条目中选原下标最小者。
     executable = {idx for idx, p in plan.items() if not p.block_reasons}
     deps: dict[int, int] = {}

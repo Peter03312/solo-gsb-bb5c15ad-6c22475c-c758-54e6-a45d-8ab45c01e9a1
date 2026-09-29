@@ -1181,8 +1181,10 @@ class HardlinkBlockReasonOut(BaseModel):
             "LEAF_ANCESTOR（祖先路径被文件/硬链接占据）、TARGET_PATH_UNSAFE"
             "（硬链接目标为空或路径不安全）、TARGET_MISSING（目标缺失）、"
             "TARGET_AMBIGUOUS（目标命中同键重复组，身份不唯一）、"
-            "TARGET_IS_DIRECTORY（目标是目录）、TARGET_CYCLE（目标链成环）、"
-            "TARGET_BLOCKED（目标链途经条目被阻断，阻断沿链传播）"
+            "TARGET_IS_DIRECTORY（目标是目录）、TARGET_CYCLE（硬链接自身属于"
+            "目标环）、TARGET_BLOCKED（自身在环外但目标链无法到达可落盘普通"
+            "文件——链上首个自身被阻断目标，如指向目标环的环入口；阻断沿链"
+            "传播）"
         ),
     )
     related_indices: list[int] = Field(
@@ -1190,8 +1192,8 @@ class HardlinkBlockReasonOut(BaseModel):
         description=(
             "相关条目下标（从 1 开始，升序）：如 DUPLICATE_KEY 的同键其他成员、"
             "LEAF_ANCESTOR 的占据者、TARGET_IS_DIRECTORY 的目录条目、"
-            "TARGET_CYCLE 的重复节点、TARGET_BLOCKED 的链上首个阻断节点；"
-            "无关联时为空列表"
+            "TARGET_CYCLE 的再次命中节点、TARGET_BLOCKED 的链上首个被阻断目标"
+            "（指向目标环的环外条目为环入口）；无关联时为空列表"
         ),
     )
 

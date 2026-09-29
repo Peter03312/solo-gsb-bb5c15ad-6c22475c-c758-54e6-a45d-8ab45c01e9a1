@@ -665,8 +665,8 @@ Windows 路径规范化与 `casefold` 比较键，全程不访问文件系统。
 | `TARGET_MISSING` | 目标比较键不对应任何安全条目（不存在，或仅被不安全条目占据） | — |
 | `TARGET_AMBIGUOUS` | 目标命中同键重复组，目标身份不唯一 | 同键组全部成员 |
 | `TARGET_IS_DIRECTORY` | 直接目标是目录（硬链接只能指向普通文件，不能穿过目录继续追踪） | 目录条目 |
-| `TARGET_CYCLE` | 目标链成环（沿链再次遇到已经过的硬链接；自环也算） | 再次命中的链上节点 |
-| `TARGET_BLOCKED` | 目标链途经的条目本身被阻断（含最终普通文件被阻断）；阻断沿链传播 | 链上首个阻断节点 |
+| `TARGET_CYCLE` | 硬链接**自身属于目标环**（其 ok 目标边位于某个硬链接环上，沿链再次遇到已经过的硬链接；自环也算）。环外条目不报本原因 | 再次命中的链上节点 |
+| `TARGET_BLOCKED` | 硬链接自身在环外、但目标链无法到达可落盘的普通文件：链上首个**自身被阻断**的目标（环入口/缺目/歧义/目录/目标不安全，或最终普通文件被阻断）；阻断沿链传播。**从环外指向目标环的硬链接报本原因**（不是 `TARGET_CYCLE`），相关下标为环入口 | 链上首个被阻断目标 |
 
 其他要点：
 
@@ -674,6 +674,12 @@ Windows 路径规范化与 `casefold` 比较键，全程不访问文件系统。
   文件或硬链接”逐级命中；成环时末项为再次命中的链上条目。追踪纯由清单结构
   决定，与条目遍历顺序无关。`final_file_index` 为链到达的最终普通文件下标，
   未能到达（缺目/目录/歧义/成环/途经阻断）时为 `null`。
+- **环成员 vs 环外指向环**：只有自身位于目标环上的硬链接报 `TARGET_CYCLE`；
+  从环外（“尾巴”）指向该环的硬链接不属于环，报 `TARGET_BLOCKED`，其
+  `related_indices` 指向链上首个被阻断目标（即环入口），目标链仍按逐跳结果
+  完整返回（末项为再次命中的环入口），`final_file_index` 为 `null`。单纯被
+  环传播阻断的尾巴节点不计为“首个被阻断目标”，首个始终是环入口本身。环成员
+  身份按“硬链接→硬链接”的 ok 边求有向环得到，是纯结构属性，与遍历顺序无关。
 - 被阻断条目不进入执行顺序；**目标被阻断的硬链接同样阻断**（`TARGET_BLOCKED`）。
 - **执行顺序**：文件与目录无依赖，硬链接依赖其**直接目标已落盘**。每一步在
   “未排定且自身未阻断、且依赖已满足”的条目中选**原下标最小**者执行。因此
@@ -705,13 +711,38 @@ curl -s http://localhost:8000/api/v1/hardlink-preview \
     {"path":"h1","type":"hardlink","target":"f.txt"},
     {"path":"h2","type":"hardlink","target":"h1"},
     {"path":"loop1","type":"hardlink","target":"loop2"},
-    {"path":"loop2","type":"hardlink","target":"loop1"}
+    {"path":"loop2","type":"hardlink","target":"loop1"},
+    {"path":"into_loop","type":"hardlink","target":"loop1"}
   ]}'
 ```
 
 上例执行顺序为 `f.txt → h1 → h2`（顶层 `execution_order` 为 `[1, 2, 3]`），
 `h2` 的 `target_chain` 为 `h2 → h1 → f.txt`、`final_file_index` 为 1；
-`loop1`/`loop2` 均以 `TARGET_CYCLE` 阻断，不进入执行顺序。
+`loop1`/`loop2` 自身属于目标环，均以 `TARGET_CYCLE` 阻断；`into_loop`
+（下标 6）在环外指向该环，报 `TARGET_BLOCKED` 而非 `TARGET_CYCLE`，
+`related_indices` 为 `[4]`（环入口 `loop1`），`target_chain` 逐跳返回为
+`[6, 4, 5, 4]`，`final_file_index` 为 `null`。三条均不进入执行顺序。
+
+再看一个环外尾巴的 HTTP 调用（`out2 → out1 → c1 → c2 → c1`）：
+
+```bash
+curl -s http://localhost:8000/api/v1/hardlink-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[
+    {"path":"c1","type":"hardlink","target":"c2"},
+    {"path":"c2","type":"hardlink","target":"c1"},
+    {"path":"out1","type":"hardlink","target":"c1"},
+    {"path":"out2","type":"hardlink","target":"out1"}
+  ]}'
+```
+
+响应中 `c1`/`c2` 为 `TARGET_CYCLE`；`out1`（#3）、`out2`（#4）均为
+`TARGET_BLOCKED`，二者的 `related_indices` 都是 `[1]`——`out1` 只是被环
+传播阻断，链上首个**自身被阻断**目标仍是环入口 `c1`；`out2` 的
+`target_chain` 为 `[4, 3, 1, 2, 1]`，`final_file_index` 为 `null`，顶层
+`execution_order` 为 `[]`。若环外尾巴还带有自身的独立阻断原因（如
+`LEAF_ANCESTOR`），各原因仍逐条保留，`primary_block_reason` 取枚举序最靠前
+者。
 
 ## 规范化规则（Windows 目标）
 
