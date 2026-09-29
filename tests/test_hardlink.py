@@ -325,8 +325,9 @@ def test_self_cycle_and_two_node_and_three_node_cycles():
     assert body["execution_order"] == [4]
 
 
-def test_hardlink_into_a_cycle_is_cycle_not_blocked():
-    # 指向循环的硬链接沿结构追踪同样成环（重复点是循环入口），归 TARGET_CYCLE。
+def test_hardlink_into_a_cycle_is_blocked_not_cycle():
+    # 环外的 in 指向循环 c1↔c2：自身不属于目标环，不报 TARGET_CYCLE，
+    # 而报 TARGET_BLOCKED，关联下标指向链上首个被阻断目标（环入口 c1）。
     body = _plan(
         [
             {"path": "in", "type": "hardlink", "target": "c1"},
@@ -334,10 +335,66 @@ def test_hardlink_into_a_cycle_is_cycle_not_blocked():
             {"path": "c2", "type": "hardlink", "target": "c1"},
         ]
     )
-    entry = body["entries"][0]
-    assert entry["primary_block_reason"] == "TARGET_CYCLE"
+    entries = _by_index(body)
+    entry = entries[1]
+    assert "TARGET_CYCLE" not in _reasons(entry)
+    assert entry["primary_block_reason"] == "TARGET_BLOCKED"
+    assert _reasons(entry)["TARGET_BLOCKED"] == [2]
+    # 目标链仍按逐跳结果返回（含再次命中的环入口），未到普通文件。
     assert [n["index"] for n in entry["target_chain"]] == [1, 2, 3, 2]
-    assert _reasons(entry)["TARGET_CYCLE"] == [2]
+    assert entry["final_file_index"] is None
+    assert entry["execution_order"] is None
+    # 环成员自身仍报 TARGET_CYCLE，且均不进执行顺序。
+    assert entries[2]["primary_block_reason"] == "TARGET_CYCLE"
+    assert entries[3]["primary_block_reason"] == "TARGET_CYCLE"
+    assert body["execution_order"] == []
+
+
+def test_pointer_into_cycle_result_independent_of_manifest_order():
+    # 环外指针无论出现在环成员之前还是之后，判定结果一致（纯结构属性）。
+    for entries in (
+        [
+            {"path": "out", "type": "hardlink", "target": "c1"},
+            {"path": "c1", "type": "hardlink", "target": "c2"},
+            {"path": "c2", "type": "hardlink", "target": "c1"},
+        ],
+        [
+            {"path": "c1", "type": "hardlink", "target": "c2"},
+            {"path": "c2", "type": "hardlink", "target": "c1"},
+            {"path": "out", "type": "hardlink", "target": "c1"},
+        ],
+    ):
+        body = _plan(entries)
+        by_path = {e["original_path"]: e for e in body["entries"]}
+        out = by_path["out"]
+        assert "TARGET_CYCLE" not in _reasons(out)
+        assert _reasons(out)["TARGET_BLOCKED"] == [by_path["c1"]["index"]]
+        assert by_path["c1"]["primary_block_reason"] == "TARGET_CYCLE"
+        assert by_path["c2"]["primary_block_reason"] == "TARGET_CYCLE"
+
+
+def test_blocked_related_points_to_first_blocked_target_before_cycle():
+    # 链上先经过其他被阻断条目再进入环：关联下标为链上首个被阻断目标，
+    # 而非更靠后的环成员。
+    body = _plan(
+        [
+            {"path": "out", "type": "hardlink", "target": "leaf/mid"},
+            {"path": "leaf", "type": "file"},  # 叶子占据 #3 祖先路径
+            {"path": "leaf/mid", "type": "hardlink", "target": "c1"},
+            {"path": "c1", "type": "hardlink", "target": "c2"},
+            {"path": "c2", "type": "hardlink", "target": "c1"},
+        ]
+    )
+    entries = _by_index(body)
+    assert _reasons(entries[3])["LEAF_ANCESTOR"] == [2]
+    assert _reasons(entries[1])["TARGET_BLOCKED"] == [3]
+    assert [n["index"] for n in entries[1]["target_chain"]] == [1, 3, 4, 5, 4]
+    assert entries[1]["final_file_index"] is None
+    # mid 自身也在环外：既有自身叶子祖先阻断，又因指向环被传播阻断。
+    assert _reasons(entries[3])["TARGET_BLOCKED"] == [4]
+    assert entries[4]["primary_block_reason"] == "TARGET_CYCLE"
+    assert entries[5]["primary_block_reason"] == "TARGET_CYCLE"
+    assert body["execution_order"] == [2]  # 仅叶子文件 leaf 可执行
 
 
 def test_blocked_target_propagates_through_chain():

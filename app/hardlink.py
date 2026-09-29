@@ -21,13 +21,15 @@
 * ``TARGET_AMBIGUOUS``：硬链接目标比较键命中同键重复组（目标身份不唯一）。
 * ``TARGET_IS_DIRECTORY``：硬链接直接指向的是目录（硬链接只能指向普通文件，
   不能逐级穿过目录）。
-* ``TARGET_CYCLE``：硬链接目标链成环（再次沿链遇到已经过的硬链接）。
+* ``TARGET_CYCLE``：硬链接目标链成环且**自身属于该环**（沿链再次遇到自身；
+  自环也算）。
 * ``TARGET_BLOCKED``：目标链途经的条目本身被阻断（链上首个阻断节点，含最终
-  普通文件被阻断的情形）；目标阻断沿链传播。
+  普通文件被阻断、以及自身不在环上但目标链进入目标环的情形）；目标阻断沿链
+  传播。
 
 每条条目可同时携带多个阻断原因；``primary_block_reason`` 取其中枚举序最靠前
-（最根本）的一个，便于调用方快速分类。环判定为纯结构属性（沿 ok 边追踪，与
-阻断状态无关），结果不依赖条目遍历顺序。
+（最根本）的一个，便于调用方快速分类。环成员身份与环判定均为纯结构属性
+（沿 ok 边追踪，与阻断状态无关），结果不依赖条目遍历顺序。
 
 可执行顺序（硬链接只依赖其**直接目标**——落盘时只需直接目标已存在）：每一步
 在“未排定且自身未阻断且依赖已满足”的条目中选**原下标最小**者；文件与目录
@@ -166,8 +168,8 @@ def plan_hardlinks(
             entry_plan.block_reasons.append(reason)
         if related:
             existed = entry_plan.related_indices_by_reason.setdefault(reason, [])
-            # TARGET_CYCLE 的相关下标是“再次命中的链上节点”，自环 h→h 时即
-            # 条目自身，仍需保留；其余原因跳过自身。
+            # TARGET_CYCLE 只标记自身属于目标环的条目，相关下标（再次命中的
+            # 链上节点）即条目自身，仍需保留；其余原因跳过自身。
             for rel in related:
                 if rel != index or reason is HardlinkBlockReason.TARGET_CYCLE:
                     if rel not in existed:
@@ -262,8 +264,45 @@ def plan_hardlinks(
     def node(index: int) -> ChainNode:
         return ChainNode(index, by_index[index].canonical_path)
 
-    # 5) 沿链追踪（纯结构判定，与节点阻断状态无关，保证结果与遍历顺序无关）：
-    #    普通文件结束；硬链接继续；再次遇到链上硬链接即 TARGET_CYCLE；
+    def has_root_block(index: int) -> bool:
+        """是否携带 TARGET_BLOCKED 之外的（根本性）阻断原因。"""
+        return any(
+            reason is not HardlinkBlockReason.TARGET_BLOCKED
+            for reason in plan[index].block_reasons
+        )
+
+    # 5a) 环成员预判定（纯结构，与阻断状态及遍历顺序无关）：沿 ok 边追踪，
+    #     首个重复节点为起点自身时起点才属于目标环，标记 TARGET_CYCLE；
+    #     环外指向环的条目不在此标记（在主循环中归为 TARGET_BLOCKED）。
+    for entry in entries:
+        if entry.entry_type != HARDLINK_TYPE or entry.unsafe:
+            continue
+        idx = entry.index
+        if direct[idx][0] != "ok":
+            continue
+        seen = {idx}
+        current = idx
+        while True:
+            outcome = direct.get(current)
+            if outcome is None or outcome[0] != "ok":
+                break  # 链终止于文件/缺目/歧义/目录/不安全目标，无环
+            next_index = outcome[1]
+            if by_index[next_index].entry_type == FILE_TYPE:
+                break
+            if next_index in seen:
+                if next_index == idx:
+                    add_reason(
+                        idx,
+                        HardlinkBlockReason.TARGET_CYCLE,
+                        related=[next_index],
+                    )
+                break
+            seen.add(next_index)
+            current = next_index
+
+    # 5b) 沿链追踪（纯结构判定，与节点阻断状态无关，保证结果与遍历顺序无关）：
+    #    普通文件结束；硬链接继续；再次遇到链上硬链接时，起点自身在环上归
+    #    TARGET_CYCLE（预判定已标记），环外指向环归 TARGET_BLOCKED；
     #    缺目/歧义/目录/目标不安全按链位置归类（起点为自身原因，途经点传播
     #    TARGET_BLOCKED）；正常到达的链上若存在被阻断节点也传播 TARGET_BLOCKED。
     for entry in entries:
@@ -327,11 +366,26 @@ def plan_hardlinks(
                     final_file = target_index
                     break
                 if target_index in visited:
-                    add_reason(
-                        idx,
-                        HardlinkBlockReason.TARGET_CYCLE,
-                        related=[target_index],
-                    )
+                    if target_index == idx:
+                        # 起点自身在环上（环成员已在预判定阶段标记，此处幂等）。
+                        add_reason(
+                            idx,
+                            HardlinkBlockReason.TARGET_CYCLE,
+                            related=[target_index],
+                        )
+                    else:
+                        # 起点不在环上（环外指向目标环）：报 TARGET_BLOCKED，
+                        # 关联链上首个被阻断目标（环成员已在预判定阶段标记，
+                        # 故必有命中；途经的 TARGET_BLOCKED 传播节点不算根本
+                        # 阻断源，跳过）。
+                        for stepped in chain[1:]:
+                            if has_root_block(stepped.index):
+                                add_reason(
+                                    idx,
+                                    HardlinkBlockReason.TARGET_BLOCKED,
+                                    related=[stepped.index],
+                                )
+                                break
                     break
                 visited.add(target_index)
                 current = target_index

@@ -665,8 +665,8 @@ Windows 路径规范化与 `casefold` 比较键，全程不访问文件系统。
 | `TARGET_MISSING` | 目标比较键不对应任何安全条目（不存在，或仅被不安全条目占据） | — |
 | `TARGET_AMBIGUOUS` | 目标命中同键重复组，目标身份不唯一 | 同键组全部成员 |
 | `TARGET_IS_DIRECTORY` | 直接目标是目录（硬链接只能指向普通文件，不能穿过目录继续追踪） | 目录条目 |
-| `TARGET_CYCLE` | 目标链成环（沿链再次遇到已经过的硬链接；自环也算） | 再次命中的链上节点 |
-| `TARGET_BLOCKED` | 目标链途经的条目本身被阻断（含最终普通文件被阻断）；阻断沿链传播 | 链上首个阻断节点 |
+| `TARGET_CYCLE` | 目标链成环且**自身属于该环**（沿链再次遇到自身；自环也算） | 再次命中的链上节点（即自身） |
+| `TARGET_BLOCKED` | 目标链途经的条目本身被阻断（含最终普通文件被阻断，以及**自身不在环上但目标链进入目标环**的情形）；阻断沿链传播 | 链上首个被阻断目标 |
 
 其他要点：
 
@@ -674,6 +674,11 @@ Windows 路径规范化与 `casefold` 比较键，全程不访问文件系统。
   文件或硬链接”逐级命中；成环时末项为再次命中的链上条目。追踪纯由清单结构
   决定，与条目遍历顺序无关。`final_file_index` 为链到达的最终普通文件下标，
   未能到达（缺目/目录/歧义/成环/途经阻断）时为 `null`。
+- **环成员与环外依赖的区分**：只有**自身属于目标环**的硬链接报
+  `TARGET_CYCLE`（沿链再次遇到自身）；**从环外指向该环**的硬链接报
+  `TARGET_BLOCKED`，`related_indices` 指向链上首个被阻断目标（通常为环入口，
+  若链上更靠前位置已有其他被阻断条目则指向该条目），其 `target_chain`
+  仍按逐跳结果返回（含再次命中的环入口），`final_file_index` 为 `null`。
 - 被阻断条目不进入执行顺序；**目标被阻断的硬链接同样阻断**（`TARGET_BLOCKED`）。
 - **执行顺序**：文件与目录无依赖，硬链接依赖其**直接目标已落盘**。每一步在
   “未排定且自身未阻断、且依赖已满足”的条目中选**原下标最小**者执行。因此
@@ -712,6 +717,26 @@ curl -s http://localhost:8000/api/v1/hardlink-preview \
 上例执行顺序为 `f.txt → h1 → h2`（顶层 `execution_order` 为 `[1, 2, 3]`），
 `h2` 的 `target_chain` 为 `h2 → h1 → f.txt`、`final_file_index` 为 1；
 `loop1`/`loop2` 均以 `TARGET_CYCLE` 阻断，不进入执行顺序。
+
+环外指向环的示例（区分循环成员与依赖被阻断的调用方）：
+
+```bash
+curl -s http://localhost:8000/api/v1/hardlink-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[
+    {"path":"out","type":"hardlink","target":"c1"},
+    {"path":"c1","type":"hardlink","target":"c2"},
+    {"path":"c2","type":"hardlink","target":"c1"},
+    {"path":"f.txt","type":"file"}
+  ]}'
+```
+
+上例中 `c1`/`c2` 自身属于目标环，均报 `TARGET_CYCLE`；`out` 在环外、仅
+依赖被环阻断，报 `TARGET_BLOCKED` 且 `related_indices` 为 `[2]`（链上首个
+被阻断目标，即环入口 `c1`），其 `target_chain` 仍按逐跳结果返回
+`out → c1 → c2 → c1`，`final_file_index` 为 `null`；三条硬链接都不进入
+执行顺序，顶层 `execution_order` 为 `[4]`（仅 `f.txt` 可执行），
+`summary.blocked_by_reason` 为 `{"TARGET_CYCLE": 2, "TARGET_BLOCKED": 1}`。
 
 ## 规范化规则（Windows 目标）
 
